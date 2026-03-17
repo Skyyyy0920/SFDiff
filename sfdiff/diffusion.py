@@ -185,8 +185,11 @@ class SCGuidedDiffusion:
         B, N, _ = shape
 
         # Start from symmetric pure noise at t=T
-        x_t = torch.randn(B, N, N, device=device)
-        x_t = self.sigma * (x_t + x_t.transpose(-2, -1)) / 2.0
+        # Symmetrize first, then scale — keeps semantics consistent with q_sample
+        # where noise is symmetrized independently of sigma scaling.
+        noise = torch.randn(B, N, N, device=device)
+        noise = (noise + noise.transpose(-2, -1)) / 2.0
+        x_t = noise * self.sigma
 
         for step in reversed(range(1, self.T + 1)):
             t = torch.full((B,), step, device=device, dtype=torch.long)
