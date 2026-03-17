@@ -1,0 +1,8 @@
+# SFDiff requirements (superset of AFR-Net/requirements.txt)
+torch>=2.4.0
+dgl>=2.4.0
+numpy>=2.1.0
+scipy>=1.15.0
+scikit-learn>=1.7.0
+tqdm>=4.67.0
+einops>=0.8.0
