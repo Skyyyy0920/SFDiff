@@ -1,11 +1,12 @@
 """
 SC-guided diffusion process for SFDiff.
 
-Forward process: q(x_t | x_0, L_SC) = N(H_t x_0, sigma^2 I)
+Forward process: q(x_t | x_0, L_SC) = N(H_t x_0 H_t, sigma^2 I)
   where H_t = exp(-beta_t L_SC) is the graph heat kernel.
+  Bilateral multiplication preserves FC matrix symmetry.
 
-Reverse process: learned denoising from t=T to t=0, using
-  the predicted noise eps_theta to estimate x_0 at each step.
+Reverse process: x0-prediction — the network directly predicts x_0,
+  avoiding numerically unstable inverse heat kernel computation.
 """
 
 import math
@@ -14,16 +15,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-from .heat_kernel import compute_heat_kernel_batch, compute_heat_kernel_inv_batch
+from .heat_kernel import compute_heat_kernel_batch
 
 
 class SCGuidedDiffusion:
     """SC-guided diffusion process for brain FC matrices.
 
-    The forward process replaces standard Gaussian diffusion with heat diffusion
-    on the structural connectivity graph:
-        x_t = H_t @ x_0 + sigma * epsilon
-    where H_t is the graph heat kernel and epsilon ~ N(0, I).
+    The forward process replaces standard Gaussian diffusion with bilateral heat
+    diffusion on the structural connectivity graph:
+        x_t = H_t @ x_0 @ H_t + sigma * epsilon_sym
+    where H_t is the graph heat kernel and epsilon_sym is symmetrized Gaussian noise.
 
     Args:
         T: Number of diffusion timesteps.
@@ -76,25 +77,32 @@ class SCGuidedDiffusion:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward process: sample x_t given x_0 and SC eigendecomposition.
 
-        x_t = H_t @ x_0 + sigma * noise
+        x_t = H_t @ x_0 @ H_t + sigma * noise_sym
+
+        Bilateral multiplication (H_t @ x_0 @ H_t) preserves the symmetry of
+        the FC matrix, as opposed to single-sided H_t @ x_0 which breaks it.
+        The noise is also symmetrized to maintain overall symmetry.
 
         Args:
-            x0: [B, N, N] original FC matrices.
+            x0: [B, N, N] original FC matrices (symmetric).
             t: [B] timestep indices (1..T).
             eigval: [B, N] precomputed eigenvalues.
             eigvec: [B, N, N] precomputed eigenvectors.
 
         Returns:
-            x_t: [B, N, N] noisy FC matrix.
-            noise: [B, N, N] the sampled Gaussian noise.
+            x_t: [B, N, N] noisy FC matrix (symmetric).
+            noise: [B, N, N] the sampled symmetric Gaussian noise.
         """
         beta_t = self.get_beta(t)  # [B]
         H_t = compute_heat_kernel_batch(eigval, eigvec, beta_t)  # [B, N, N]
 
-        # Apply heat kernel to each row of FC (row-wise signal diffusion)
-        mean = H_t @ x0  # [B, N, N]
+        # Bilateral heat diffusion preserves FC symmetry
+        mean = H_t @ x0 @ H_t  # [B, N, N]
 
+        # Symmetrize noise so x_t stays symmetric
         noise = torch.randn_like(x0)  # [B, N, N]
+        noise = (noise + noise.transpose(-2, -1)) / 2.0
+
         x_t = mean + self.sigma * noise
 
         return x_t, noise
@@ -108,15 +116,16 @@ class SCGuidedDiffusion:
         eigvec: torch.Tensor,
         batch: dict,
     ) -> torch.Tensor:
-        """One reverse diffusion step.
+        """One reverse diffusion step (x0-prediction).
 
-        Estimate x_0 from the predicted noise, then compute x_{t-1}:
-            x_0_hat = H_t^{-1} (x_t - sigma * eps_hat)
-            x_{t-1} = H_{t-1} @ x_0_hat + sigma * z   (for t > 1)
-            x_{t-1} = x_0_hat                           (for t = 1)
+        The network directly predicts x_0, avoiding numerically unstable
+        inverse heat kernel computation:
+            x_0_hat = model(x_t, t, batch)
+            x_{t-1} = H_{t-1} @ x_0_hat @ H_{t-1} + sigma * z_sym  (for t > 1)
+            x_{t-1} = x_0_hat                                         (for t = 1)
 
         Args:
-            model: Denoiser network.
+            model: Denoiser network (returns x0 prediction).
             x_t: [B, N, N] current noisy FC.
             t: [B] current timestep.
             eigval: [B, N] eigenvalues.
@@ -126,26 +135,23 @@ class SCGuidedDiffusion:
         Returns:
             x_prev: [B, N, N] denoised FC at t-1.
         """
-        # Predict noise
-        eps_hat = model(x_t, t, batch)  # [B, N, N]
-        eps_hat = (eps_hat + eps_hat.transpose(-2, -1)) / 2.0  # symmetrize
-
-        beta_t = self.get_beta(t)  # [B]
-
-        # Estimate x_0: x_0_hat = H_t^{-1} (x_t - sigma * eps_hat)
-        H_t_inv = compute_heat_kernel_inv_batch(eigval, eigvec, beta_t)  # [B, N, N]
-        x0_hat = H_t_inv @ (x_t - self.sigma * eps_hat)  # [B, N, N]
+        # Network directly predicts x0
+        x0_hat = model(x_t, t, batch)  # [B, N, N]
+        x0_hat = (x0_hat + x0_hat.transpose(-2, -1)) / 2.0  # symmetrize
         x0_hat = x0_hat.clamp(-1.0, 1.0)
 
-        # For t > 1: compute x_{t-1} = H_{t-1} @ x_0_hat + sigma * z
         t_prev = t - 1
         is_last = (t_prev == 0).float().view(-1, 1, 1)  # [B, 1, 1]
 
         beta_prev = self.get_beta(t_prev.clamp(min=1))
         H_prev = compute_heat_kernel_batch(eigval, eigvec, beta_prev)  # [B, N, N]
 
-        mean_prev = H_prev @ x0_hat  # [B, N, N]
+        # Bilateral heat diffusion mean at t-1
+        mean_prev = H_prev @ x0_hat @ H_prev  # [B, N, N]
+
+        # Symmetric noise (not added at t=1)
         z = torch.randn_like(x_t)
+        z = (z + z.transpose(-2, -1)) / 2.0
         x_prev = mean_prev + self.sigma * z
 
         # At t=1 (t_prev=0), return x_0_hat directly without noise
@@ -178,8 +184,9 @@ class SCGuidedDiffusion:
         """
         B, N, _ = shape
 
-        # Start from pure noise at t=T
-        x_t = self.sigma * torch.randn(B, N, N, device=device)
+        # Start from symmetric pure noise at t=T
+        x_t = torch.randn(B, N, N, device=device)
+        x_t = self.sigma * (x_t + x_t.transpose(-2, -1)) / 2.0
 
         for step in reversed(range(1, self.T + 1)):
             t = torch.full((B,), step, device=device, dtype=torch.long)
@@ -197,7 +204,6 @@ class SCGuidedDiffusion:
 
 
 if __name__ == '__main__':
-    # Quick sanity check
     print("=== diffusion.py sanity check ===")
 
     B, N = 2, 10
@@ -211,31 +217,64 @@ if __name__ == '__main__':
     sc = sc.clamp(min=0.0)
 
     eigval, eigvec = precompute_eigen(sc)
-    eigval_b = eigval.unsqueeze(0).expand(B, -1)
-    eigvec_b = eigvec.unsqueeze(0).expand(B, -1, -1)
+    eigval_b = eigval.unsqueeze(0).expand(B, -1).clone()
+    eigvec_b = eigvec.unsqueeze(0).expand(B, -1, -1).clone()
 
-    # Create synthetic FC
+    # Create symmetric synthetic FC
     x0 = torch.randn(B, N, N) * 0.3
     x0 = (x0 + x0.transpose(-2, -1)) / 2.0
     x0 = x0.clamp(-1.0, 1.0)
 
-    # Test forward process
     diffusion = SCGuidedDiffusion(T=T, beta_min=1e-4, beta_max=0.5, sigma=0.1)
+
+    # --- Bug 1 verification: q_sample preserves symmetry ---
+    print("\n[Bug 1] q_sample symmetry verification:")
+    t_mid = torch.full((B,), 25, dtype=torch.long)
+    x_t, noise = diffusion.q_sample(x0, t_mid, eigval_b, eigvec_b)
+
+    x_t_sym_err = (x_t - x_t.transpose(-2, -1)).abs().max().item()
+    noise_sym_err = (noise - noise.transpose(-2, -1)).abs().max().item()
+    print(f"  x_t symmetry error: {x_t_sym_err:.2e} (should be < 1e-5)")
+    assert x_t_sym_err < 1e-5, f"x_t symmetry error too large: {x_t_sym_err}"
+    print(f"  noise symmetry error: {noise_sym_err:.2e} (should be < 1e-5)")
+    assert noise_sym_err < 1e-5, f"noise symmetry error too large: {noise_sym_err}"
 
     # Test at t=1 (near identity heat kernel)
     t_low = torch.ones(B, dtype=torch.long)
-    x_t_low, noise_low = diffusion.q_sample(x0, t_low, eigval_b, eigvec_b)
+    x_t_low, _ = diffusion.q_sample(x0, t_low, eigval_b, eigvec_b)
     diff_low = (x_t_low - x0).abs().mean().item()
-    print(f"q_sample at t=1: mean diff from x0 = {diff_low:.4f} (should be ~sigma={diffusion.sigma})")
-
-    # Test at t=T (heavily diffused)
-    t_high = torch.full((B,), T, dtype=torch.long)
-    x_t_high, noise_high = diffusion.q_sample(x0, t_high, eigval_b, eigvec_b)
-    print(f"q_sample at t={T}: x_t range = [{x_t_high.min():.3f}, {x_t_high.max():.3f}]")
+    print(f"  q_sample at t=1: mean diff from x0 = {diff_low:.4f} (should be ~sigma={diffusion.sigma})")
 
     # Shape checks
-    assert x_t_low.shape == (B, N, N), f"Expected {(B, N, N)}, got {x_t_low.shape}"
-    assert noise_low.shape == (B, N, N)
+    assert x_t.shape == (B, N, N), f"Expected {(B, N, N)}, got {x_t.shape}"
+    assert noise.shape == (B, N, N)
+    print(f"  q_sample output shape: {x_t.shape}")
 
-    print(f"q_sample output shape: {x_t_low.shape}")
+    # --- Bug 2 verification: p_sample with mock x0-prediction model ---
+    print("\n[Bug 2] p_sample (x0-prediction) verification:")
+
+    class MockX0Model(nn.Module):
+        """Mock model that returns clamped x_t as x0 prediction."""
+        def forward(self, x_t, t, batch):
+            return x_t.clamp(-1.0, 1.0)
+
+    mock_model = MockX0Model()
+    t_test = torch.full((B,), 10, dtype=torch.long)
+    x_t_test, _ = diffusion.q_sample(x0, t_test, eigval_b, eigvec_b)
+
+    x_prev = diffusion.p_sample(mock_model, x_t_test, t_test, eigval_b, eigvec_b, batch={})
+    print(f"  p_sample output shape: {x_prev.shape} (expected {(B, N, N)})")
+    assert x_prev.shape == (B, N, N)
+
+    p_sym_err = (x_prev - x_prev.transpose(-2, -1)).abs().max().item()
+    print(f"  p_sample symmetry error: {p_sym_err:.2e} (should be < 1e-5)")
+    assert p_sym_err < 1e-5, f"p_sample symmetry error too large: {p_sym_err}"
+
+    # Test at t=1 (should return x0_hat without noise)
+    t_one = torch.ones(B, dtype=torch.long)
+    x_prev_last = diffusion.p_sample(mock_model, x_t_test, t_one, eigval_b, eigvec_b, batch={})
+    p_last_sym_err = (x_prev_last - x_prev_last.transpose(-2, -1)).abs().max().item()
+    print(f"  p_sample at t=1 symmetry error: {p_last_sym_err:.2e}")
+    assert p_last_sym_err < 1e-5
+
     print("\nAll sanity checks passed!")

@@ -84,10 +84,11 @@ class SFDiffModel(nn.Module):
         batch: Dict,
         device: str = 'cpu',
     ) -> torch.Tensor:
-        """Training forward pass: compute denoising loss.
+        """Training forward pass: compute x0-prediction loss.
 
         Samples random timesteps, computes noisy FC via forward diffusion,
-        predicts noise with the denoiser, and returns MSE loss.
+        and the network directly predicts x_0 (not noise). Loss is element-wise
+        MSE averaged over all dimensions for numerical stability.
 
         Args:
             batch: Dict from dataloader with keys:
@@ -96,7 +97,7 @@ class SFDiffModel(nn.Module):
             device: Target device.
 
         Returns:
-            loss: Scalar, Frobenius norm loss on predicted noise.
+            loss: Scalar, mean squared error on x0 prediction.
         """
         x0 = batch['F_raw'].to(device)       # [B, N, N]
         eigval = batch['eigval'].to(device)   # [B, N]
@@ -106,14 +107,14 @@ class SFDiffModel(nn.Module):
         # Sample random timesteps uniformly from [1, T]
         t = torch.randint(1, self.diffusion.T + 1, (B,), device=device)
 
-        # Forward diffusion: get noisy FC and the noise that was added
-        x_t, noise = self.diffusion.q_sample(x0, t, eigval, eigvec)
+        # Forward diffusion: get noisy FC
+        x_t, _ = self.diffusion.q_sample(x0, t, eigval, eigvec)
 
-        # Predict noise with denoiser
-        eps_hat = self.denoiser(x_t, t, batch)
+        # Network predicts x0 (not noise)
+        x0_hat = self.denoiser(x_t, t, batch)
 
-        # MSE loss (Frobenius norm over N x N, averaged over batch)
-        loss = ((noise - eps_hat) ** 2).sum(dim=(-2, -1)).mean()
+        # Frobenius mean loss (element-wise MSE, numerically stable & cross-dataset comparable)
+        loss = ((x0 - x0_hat) ** 2).mean()
 
         return loss
 
@@ -162,7 +163,6 @@ class SFDiffModel(nn.Module):
 
 
 if __name__ == '__main__':
-    # Quick sanity check
     print("=== sfdiff.py sanity check ===")
 
     B, N = 2, 10
@@ -177,9 +177,13 @@ if __name__ == '__main__':
         T=T, beta_min=1e-4, beta_max=0.5, sigma=0.1,
     )
 
-    # Synthetic batch
+    # Symmetric synthetic FC
+    F_raw = torch.randn(B, N, N) * 0.3
+    F_raw = (F_raw + F_raw.transpose(-2, -1)) / 2.0
+    F_raw = F_raw.clamp(-1, 1)
+
     batch = {
-        'F_raw': torch.randn(B, N, N).clamp(-1, 1),
+        'F_raw': F_raw,
         'eigval': torch.rand(B, N).clamp(min=0),
         'eigvec': torch.randn(B, N, N),
         'node_feat': torch.randn(B, N, N),
@@ -191,39 +195,46 @@ if __name__ == '__main__':
         'labels': torch.zeros(B, 1),
     }
 
-    # Test training forward
+    # --- Verification 1: forward loss is scalar and reasonable ---
+    print("\n[Verification 1] forward loss (x0-prediction):")
     loss = model(batch, device='cpu')
-    print(f"Training loss: {loss.item():.4f}")
+    print(f"  Training loss: {loss.item():.4f}")
     assert loss.dim() == 0, "Loss should be scalar"
     assert loss.item() > 0, "Loss should be positive"
+    assert loss.item() < 10.0, f"Loss too large for N={N}: {loss.item():.4f} (expect 0.01~1.0 range)"
+    print(f"  Loss in expected range [0, 10): OK")
 
     # Test backward
     loss.backward()
-    print("Backward pass: OK")
+    print("  Backward pass: OK")
 
-    # Test sampling
+    # --- Verification 2: sample generates valid FC ---
+    print("\n[Verification 2] sample output quality:")
     with torch.no_grad():
         generated = model.sample(batch, device='cpu')
-    print(f"Generated FC shape: {generated.shape}")
+    print(f"  Generated FC shape: {generated.shape}")
     assert generated.shape == (B, N, N)
-    print(f"Generated FC range: [{generated.min():.3f}, {generated.max():.3f}]")
-    assert generated.min() >= -1.0 and generated.max() <= 1.0
 
-    # Check symmetry
+    # Symmetry
     sym_err = (generated - generated.transpose(-2, -1)).abs().max().item()
-    print(f"Generated FC symmetry error: {sym_err:.2e}")
-    assert sym_err < 1e-6
+    print(f"  Symmetry error: {sym_err:.2e} (should be < 1e-5)")
+    assert sym_err < 1e-5, f"Symmetry error too large: {sym_err}"
 
-    # Check zero diagonal
+    # Value range
+    print(f"  Value range: [{generated.min():.3f}, {generated.max():.3f}]")
+    assert generated.min() >= -1.0 and generated.max() <= 1.0, "Values out of [-1, 1]"
+
+    # Zero diagonal
     diag_err = generated.diagonal(dim1=-2, dim2=-1).abs().max().item()
-    print(f"Generated FC diagonal max: {diag_err:.2e}")
+    print(f"  Diagonal max: {diag_err:.2e} (should be 0)")
+    assert diag_err < 1e-6, f"Diagonal not zero: {diag_err}"
 
-    # Test SC embedding
+    # SC embedding
     Z_SC = model.get_sc_embedding(batch)
-    print(f"SC embedding shape: {Z_SC.shape}")
+    print(f"  SC embedding shape: {Z_SC.shape}")
     assert Z_SC.shape == (B, N, d_model)
 
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {num_params}")
+    print(f"  Total parameters: {num_params}")
 
     print("\nAll sanity checks passed!")
