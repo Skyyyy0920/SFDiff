@@ -268,6 +268,53 @@ class SFDiffDenoiser(nn.Module):
             )
         return Z_SC
 
+    def get_fused_embedding(self, fc: torch.Tensor, batch: dict) -> torch.Tensor:
+        """Extract SC-FC fused embeddings by passing real FC through the denoiser.
+
+        Uses t=1 (near-identity) so the FC encoder sees essentially clean FC.
+        The cross-attention and self-attention layers fuse SC and FC information
+        into a joint representation, reusing representations learned during
+        diffusion training.
+
+        Args:
+            fc: [B, N, N] real FC matrix.
+            batch: Dict with Graphormer SC graph inputs.
+
+        Returns:
+            Z_out: [B, N, d_model] fused SC-FC node embeddings.
+        """
+        B = fc.shape[0]
+        # t=1: minimal diffusion, FC encoder sees near-clean input
+        t = torch.ones(B, device=fc.device, dtype=torch.long)
+        t_emb = self.time_embed(t)  # [B, d_model]
+
+        # SC Encoder
+        Z_SC = self.sc_encoder(
+            node_feat=batch['node_feat'],
+            in_degree=batch['in_degree'],
+            out_degree=batch['out_degree'],
+            path_data=batch['path_data'],
+            dist=batch['dist'],
+            attn_mask=batch.get('attn_mask'),
+        )  # [B, N, d_model]
+
+        # FC Encoder
+        Z_FC = self.fc_encoder(fc, t_emb)  # [B, N, d_model]
+
+        # Cross-Attention: FC queries, SC keys/values
+        Z_cross, _ = self.cross_attn(
+            query=self.cross_norm_q(Z_FC),
+            key=self.cross_norm_kv(Z_SC),
+            value=Z_SC,
+        )
+        Z_cross = Z_FC + Z_cross  # residual
+
+        # Self-Attention
+        Z_out = self.self_attn(Z_cross)
+        Z_out = self.self_attn_norm(Z_out)  # [B, N, d_model]
+
+        return Z_out
+
 
 if __name__ == '__main__':
     # Quick sanity check (requires DGL for GraphormerNodeEncoder)

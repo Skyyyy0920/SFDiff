@@ -1,13 +1,13 @@
 """
-Mode B latent-space classifier for SFDiff.
+Classifier for SFDiff using SC-FC fused representations.
 
-Freezes the SC encoder from a pretrained SFDiff model and adds
-an MLP classification head on top of mean-pooled SC embeddings.
+Passes real FC through the pretrained denoiser (at t=1) to obtain
+cross-attention fused SC-FC embeddings, then classifies via MLP head.
 
 Architecture:
-    Frozen SC Encoder -> Z_SC [B, N, d_model]
-    Mean Pool -> Z_graph [B, d_model]
-    MLP Head -> logits [B, num_classes]
+    Real FC + SC graph → Denoiser (t=1) → Z_out [B, N, d_model]
+    Mean Pool → z [B, d_model]
+    MLP Head → logits [B, num_classes]
 """
 
 import torch
@@ -16,11 +16,12 @@ from typing import Dict
 
 
 class LatentClassifier(nn.Module):
-    """Mode B latent-space classifier using frozen SFDiff SC encoder.
+    """Classifier using SC-FC fused representations from pretrained SFDiff.
 
-    Extracts the SC encoder from a pretrained SFDiff model, freezes its
-    parameters, and trains only a lightweight MLP classification head
-    on the mean-pooled node embeddings.
+    The denoiser's cross-attention layers learned to fuse SC structure with
+    FC patterns during diffusion training. At classification time, we pass
+    the real (clean) FC through the same pipeline to extract a joint
+    SC-FC representation, then classify with an MLP head.
 
     Args:
         sfdiff_model: Pretrained SFDiffModel instance.
@@ -28,7 +29,7 @@ class LatentClassifier(nn.Module):
         num_classes: Number of output classes.
         hidden_dim: Hidden dimension of the MLP head.
         dropout: Dropout rate in the MLP head.
-        freeze_encoder: If True, freeze SC encoder weights.
+        freeze_encoder: If True, freeze all denoiser weights (encoder + attention).
     """
 
     def __init__(
@@ -42,11 +43,11 @@ class LatentClassifier(nn.Module):
     ):
         super().__init__()
 
-        # Extract the SC encoder from the pretrained SFDiff denoiser
-        self.sc_encoder = sfdiff_model.denoiser.sc_encoder
+        # Keep the full denoiser (SC encoder + FC encoder + cross/self attention)
+        self.denoiser = sfdiff_model.denoiser
 
         if freeze_encoder:
-            for param in self.sc_encoder.parameters():
+            for param in self.denoiser.parameters():
                 param.requires_grad = False
 
         self.pool_dropout = nn.Dropout(dropout * 0.5)
@@ -60,29 +61,24 @@ class LatentClassifier(nn.Module):
         )
 
     def forward(self, batch: Dict) -> torch.Tensor:
-        """Forward pass: SC encoding -> mean pool -> classification.
+        """Forward pass: fused SC-FC encoding -> mean pool -> classification.
 
         Args:
-            batch: Dict with Graphormer inputs:
-                node_feat [B, N, N], in_degree [B, N], out_degree [B, N],
-                path_data [B, N, N, max_path_len, 1], dist [B, N, N],
-                attn_mask [B, N+1, N+1] (optional).
+            batch: Dict with:
+                F_raw [B, N, N]: real FC matrix
+                node_feat, in_degree, out_degree, path_data, dist, attn_mask:
+                    Graphormer SC graph inputs.
 
         Returns:
             logits: [B, num_classes] classification logits.
         """
-        # SC encoder (possibly frozen)
-        Z_SC = self.sc_encoder(
-            node_feat=batch['node_feat'],
-            in_degree=batch['in_degree'],
-            out_degree=batch['out_degree'],
-            path_data=batch['path_data'],
-            dist=batch['dist'],
-            attn_mask=batch.get('attn_mask'),
-        )  # [B, N, d_model]
+        fc = batch['F_raw']  # [B, N, N] real FC
+
+        # Get fused SC-FC representation from pretrained denoiser
+        Z_out = self.denoiser.get_fused_embedding(fc, batch)  # [B, N, d_model]
 
         # Mean pool over nodes
-        graph_repr = Z_SC.mean(dim=1)  # [B, d_model]
+        graph_repr = Z_out.mean(dim=1)  # [B, d_model]
         graph_repr = self.pool_dropout(graph_repr)
 
         logits = self.head(graph_repr)  # [B, num_classes]
@@ -90,14 +86,12 @@ class LatentClassifier(nn.Module):
 
 
 if __name__ == '__main__':
-    # Quick sanity check
     print("=== classifier.py sanity check ===")
 
     B, N = 2, 10
     d_model = 32
     max_path_len = 5
 
-    # Create a mock SFDiff model
     from sfdiff.sfdiff import SFDiffModel
     sfdiff_model = SFDiffModel(
         N=N, d_model=d_model, nhead=4,
@@ -105,7 +99,6 @@ if __name__ == '__main__':
         dim_feedforward=64, T=10,
     )
 
-    # Build classifier
     classifier = LatentClassifier(
         sfdiff_model=sfdiff_model,
         d_model=d_model,
@@ -116,17 +109,18 @@ if __name__ == '__main__':
     )
 
     # Check frozen parameters
-    frozen_params = sum(1 for p in classifier.sc_encoder.parameters() if not p.requires_grad)
-    total_encoder_params = sum(1 for p in classifier.sc_encoder.parameters())
-    print(f"SC encoder: {frozen_params}/{total_encoder_params} params frozen")
-    assert frozen_params == total_encoder_params, "All encoder params should be frozen"
+    frozen_params = sum(1 for p in classifier.denoiser.parameters() if not p.requires_grad)
+    total_denoiser_params = sum(1 for p in classifier.denoiser.parameters())
+    print(f"Denoiser: {frozen_params}/{total_denoiser_params} params frozen")
+    assert frozen_params == total_denoiser_params
 
     trainable_params = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in classifier.parameters())
     print(f"Trainable: {trainable_params}, Total: {total_params}")
 
-    # Forward pass
+    # Forward pass with real FC
     batch = {
+        'F_raw': torch.randn(B, N, N).clamp(-1, 1),
         'node_feat': torch.randn(B, N, N),
         'in_degree': torch.randint(0, 10, (B, N)),
         'out_degree': torch.randint(0, 10, (B, N)),
@@ -139,16 +133,12 @@ if __name__ == '__main__':
     print(f"Logits shape: {logits.shape}")
     assert logits.shape == (B, 2)
 
-    # Check gradient flow (only through head)
+    # Check gradient flow
     loss = logits.sum()
     loss.backward()
-    head_has_grad = all(
-        p.grad is not None for p in classifier.head.parameters()
-    )
-    encoder_has_grad = any(
-        p.grad is not None for p in classifier.sc_encoder.parameters()
-    )
-    print(f"Head gradient flow: {'OK' if head_has_grad else 'FAILED'}")
-    print(f"Encoder gradient: {'NONE (correct)' if not encoder_has_grad else 'HAS GRAD (unexpected)'}")
+    head_has_grad = all(p.grad is not None for p in classifier.head.parameters())
+    denoiser_has_grad = any(p.grad is not None for p in classifier.denoiser.parameters())
+    print(f"Head gradient: {'OK' if head_has_grad else 'FAILED'}")
+    print(f"Denoiser gradient: {'NONE (frozen, correct)' if not denoiser_has_grad else 'HAS GRAD'}")
 
     print("\nAll sanity checks passed!")

@@ -161,6 +161,18 @@ class SFDiffModel(nn.Module):
         """
         return self.denoiser.get_sc_embedding(batch)
 
+    def get_fused_embedding(self, fc: torch.Tensor, batch: Dict) -> torch.Tensor:
+        """Extract SC-FC fused embeddings for classification.
+
+        Args:
+            fc: [B, N, N] real FC matrix.
+            batch: Dict with Graphormer SC graph inputs.
+
+        Returns:
+            Z_out: [B, N, d_model] fused SC-FC node embeddings.
+        """
+        return self.denoiser.get_fused_embedding(fc, batch)
+
 
 if __name__ == '__main__':
     print("=== sfdiff.py sanity check ===")

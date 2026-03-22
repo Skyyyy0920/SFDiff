@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+results/
+results_*/
+generated/
+*.pth
+*.pkl
+!requirements.txt
+.claude/settings.local.json
