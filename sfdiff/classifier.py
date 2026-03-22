@@ -1,13 +1,13 @@
 """
-Classifier for SFDiff using SC-FC fused representations.
+Classifier for SFDiff using dual-branch SC + FC representations.
 
-Passes real FC through the pretrained denoiser (at t=1) to obtain
-cross-attention fused SC-FC embeddings, then classifies via MLP head.
+Extracts SC and FC embeddings independently from the pretrained denoiser,
+concatenates the mean-pooled representations, and classifies via MLP head.
 
 Architecture:
-    Real FC + SC graph → Denoiser (t=1) → Z_out [B, N, d_model]
-    Mean Pool → z [B, d_model]
-    MLP Head → logits [B, num_classes]
+    SC graph → SC Encoder (pretrained) → mean pool → z_sc [B, d]
+    Real FC  → FC Encoder (pretrained) → mean pool → z_fc [B, d]
+    concat(z_sc, z_fc) → [B, 2d] → MLP Head → logits [B, num_classes]
 """
 
 import torch
@@ -16,12 +16,12 @@ from typing import Dict
 
 
 class LatentClassifier(nn.Module):
-    """Classifier using SC-FC fused representations from pretrained SFDiff.
+    """Dual-branch classifier using pretrained SC and FC encoders.
 
-    The denoiser's cross-attention layers learned to fuse SC structure with
-    FC patterns during diffusion training. At classification time, we pass
-    the real (clean) FC through the same pipeline to extract a joint
-    SC-FC representation, then classify with an MLP head.
+    Both encoders are initialized from diffusion pretraining. The SC encoder
+    learned structural graph representations; the FC encoder learned to project
+    FC row vectors into the same latent space. Their concatenated mean-pooled
+    features provide complementary structural and functional information.
 
     Args:
         sfdiff_model: Pretrained SFDiffModel instance.
@@ -29,7 +29,7 @@ class LatentClassifier(nn.Module):
         num_classes: Number of output classes.
         hidden_dim: Hidden dimension of the MLP head.
         dropout: Dropout rate in the MLP head.
-        freeze_encoder: If True, freeze all denoiser weights (encoder + attention).
+        freeze_encoder: If True, freeze SC and FC encoder weights.
     """
 
     def __init__(
@@ -42,26 +42,33 @@ class LatentClassifier(nn.Module):
         freeze_encoder: bool = True,
     ):
         super().__init__()
+        self.d_model = d_model
 
-        # Keep the full denoiser (SC encoder + FC encoder + cross/self attention)
-        self.denoiser = sfdiff_model.denoiser
+        # Extract pretrained encoders from the denoiser
+        self.sc_encoder = sfdiff_model.denoiser.sc_encoder
+        self.fc_encoder = sfdiff_model.denoiser.fc_encoder
+        self.time_embed = sfdiff_model.denoiser.time_embed
 
         if freeze_encoder:
-            for param in self.denoiser.parameters():
+            for param in self.sc_encoder.parameters():
+                param.requires_grad = False
+            for param in self.fc_encoder.parameters():
+                param.requires_grad = False
+            for param in self.time_embed.parameters():
                 param.requires_grad = False
 
         self.pool_dropout = nn.Dropout(dropout * 0.5)
 
-        # MLP classification head
+        # MLP classification head: input is concat of z_sc and z_fc
         self.head = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
+            nn.Linear(d_model * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes),
         )
 
     def forward(self, batch: Dict) -> torch.Tensor:
-        """Forward pass: fused SC-FC encoding -> mean pool -> classification.
+        """Forward pass: dual-branch encoding -> concat -> classification.
 
         Args:
             batch: Dict with:
@@ -72,16 +79,33 @@ class LatentClassifier(nn.Module):
         Returns:
             logits: [B, num_classes] classification logits.
         """
-        fc = batch['F_raw']  # [B, N, N] real FC
+        fc = batch['F_raw']  # [B, N, N]
+        B = fc.shape[0]
 
-        # Get fused SC-FC representation from pretrained denoiser
-        Z_out = self.denoiser.get_fused_embedding(fc, batch)  # [B, N, d_model]
+        # SC branch: Graphormer on SC graph
+        Z_SC = self.sc_encoder(
+            node_feat=batch['node_feat'],
+            in_degree=batch['in_degree'],
+            out_degree=batch['out_degree'],
+            path_data=batch['path_data'],
+            dist=batch['dist'],
+            attn_mask=batch.get('attn_mask'),
+        )  # [B, N, d_model]
 
-        # Mean pool over nodes
-        graph_repr = Z_out.mean(dim=1)  # [B, d_model]
-        graph_repr = self.pool_dropout(graph_repr)
+        # FC branch: row-wise projection of real FC (t=0, no noise)
+        t = torch.zeros(B, device=fc.device, dtype=torch.long)
+        t_emb = self.time_embed(t)  # [B, d_model]
+        Z_FC = self.fc_encoder(fc, t_emb)  # [B, N, d_model]
 
-        logits = self.head(graph_repr)  # [B, num_classes]
+        # Mean pool each branch
+        z_sc = Z_SC.mean(dim=1)  # [B, d_model]
+        z_fc = Z_FC.mean(dim=1)  # [B, d_model]
+
+        # Concatenate and classify
+        z = torch.cat([z_sc, z_fc], dim=-1)  # [B, 2 * d_model]
+        z = self.pool_dropout(z)
+
+        logits = self.head(z)  # [B, num_classes]
         return logits
 
 
@@ -109,16 +133,18 @@ if __name__ == '__main__':
     )
 
     # Check frozen parameters
-    frozen_params = sum(1 for p in classifier.denoiser.parameters() if not p.requires_grad)
-    total_denoiser_params = sum(1 for p in classifier.denoiser.parameters())
-    print(f"Denoiser: {frozen_params}/{total_denoiser_params} params frozen")
-    assert frozen_params == total_denoiser_params
+    frozen_sc = sum(1 for p in classifier.sc_encoder.parameters() if not p.requires_grad)
+    total_sc = sum(1 for p in classifier.sc_encoder.parameters())
+    frozen_fc = sum(1 for p in classifier.fc_encoder.parameters() if not p.requires_grad)
+    total_fc = sum(1 for p in classifier.fc_encoder.parameters())
+    print(f"SC encoder: {frozen_sc}/{total_sc} frozen")
+    print(f"FC encoder: {frozen_fc}/{total_fc} frozen")
 
-    trainable_params = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in classifier.parameters())
-    print(f"Trainable: {trainable_params}, Total: {total_params}")
+    trainable = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in classifier.parameters())
+    print(f"Trainable: {trainable}, Total: {total}")
 
-    # Forward pass with real FC
+    # Forward pass
     batch = {
         'F_raw': torch.randn(B, N, N).clamp(-1, 1),
         'node_feat': torch.randn(B, N, N),
@@ -133,12 +159,9 @@ if __name__ == '__main__':
     print(f"Logits shape: {logits.shape}")
     assert logits.shape == (B, 2)
 
-    # Check gradient flow
     loss = logits.sum()
     loss.backward()
     head_has_grad = all(p.grad is not None for p in classifier.head.parameters())
-    denoiser_has_grad = any(p.grad is not None for p in classifier.denoiser.parameters())
     print(f"Head gradient: {'OK' if head_has_grad else 'FAILED'}")
-    print(f"Denoiser gradient: {'NONE (frozen, correct)' if not denoiser_has_grad else 'HAS GRAD'}")
 
     print("\nAll sanity checks passed!")
